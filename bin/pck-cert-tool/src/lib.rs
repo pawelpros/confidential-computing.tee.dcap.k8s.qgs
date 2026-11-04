@@ -4,6 +4,7 @@
 //! Library half of `pck-cert-tool`: the Kubernetes/network-independent parsing, validation and
 //! encoding logic, exposed so it can be unit tested and fuzzed in isolation.
 
+pub mod air_gapped;
 pub mod cache;
 pub mod field_manager;
 pub mod pck_secret;

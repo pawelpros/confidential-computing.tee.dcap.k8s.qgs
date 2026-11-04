@@ -14,6 +14,9 @@ use kube::{
         watcher,
     },
 };
+use pck_cert_tool::air_gapped::{
+    ExportRequestsArgs, export_platforms_to_file, fetch_secrets_to_file,
+};
 use pck_cert_tool::cache::parse_cache_blob;
 use pck_cert_tool::field_manager::field_manager;
 use pck_cert_tool::pck_secret::{
@@ -65,9 +68,13 @@ enum Commands {
     /// Get PCK certificates from secret and write to file, watching for updates
     GetCertificates(GetCertificatesArgs),
     /// Watch platform-data secrets and register them with Intel PCS to get PCK certificates
+    /// or register them from a JSON file, writing the resulting PCK certificates to file prepared
+    /// to be applied to the cluster as Kubernetes secrets
     Register(RegisterArgs),
     /// Readiness/liveness probe helpers (exit 0 = ok, 1 = not ok)
     Probe(ProbeArgs),
+    /// Export platform request list from cluster secrets to a JSON file (offline step 1)
+    ExportRequests(ExportRequestsArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -135,6 +142,14 @@ struct RegisterArgs {
     /// Kubernetes namespace (default: default)
     #[arg(short, long, default_value = "default")]
     namespace: String,
+
+    /// Platform request JSON file; enables finite file mode and requires --output-file
+    #[arg(short = 'i', long, requires = "output_file")]
+    input_file: Option<PathBuf>,
+
+    /// Output YAML containing directly applicable Kubernetes Secrets; requires --input-file
+    #[arg(short = 'o', long, requires = "input_file")]
+    output_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -808,7 +823,22 @@ async fn main() -> Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
-            register_platforms(api_key.as_deref(), &reg_args.namespace).await?;
+
+            match (reg_args.input_file, reg_args.output_file) {
+                (Some(input_file), Some(output_file)) => {
+                    fetch_secrets_to_file(
+                        &input_file,
+                        &output_file,
+                        &reg_args.namespace,
+                        api_key.as_deref(),
+                    )
+                    .await?;
+                }
+                (None, None) => {
+                    register_platforms(api_key.as_deref(), &reg_args.namespace).await?;
+                }
+                _ => unreachable!("clap requires --input-file and --output-file together"),
+            }
         }
         Commands::Probe(probe_args) => match probe_args.command {
             ProbeCommands::CacheReady(args) => {
@@ -834,6 +864,9 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::ExportRequests(export_args) => {
+            export_platforms_to_file(export_args).await?;
+        }
     }
 
     Ok(())
@@ -845,6 +878,50 @@ mod tests {
 
     /// A well-formed, 32-hex-character sample ID for tests.
     const SAMPLE_ID: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+
+    #[test]
+    fn register_cli_supports_watcher_and_file_modes() {
+        let watcher = Args::try_parse_from(["pck-cert-tool", "register", "--namespace", "qgs"])
+            .expect("watcher mode should parse");
+        let Commands::Register(watcher) = watcher.command else {
+            panic!("expected register command");
+        };
+        assert_eq!(watcher.namespace, "qgs");
+        assert!(watcher.input_file.is_none());
+        assert!(watcher.output_file.is_none());
+
+        let file_mode = Args::try_parse_from([
+            "pck-cert-tool",
+            "register",
+            "--input-file",
+            "platforms.json",
+            "--output-file",
+            "pck-secrets.yaml",
+        ])
+        .expect("file mode should parse");
+        let Commands::Register(file_mode) = file_mode.command else {
+            panic!("expected register command");
+        };
+        assert_eq!(
+            file_mode.input_file.as_deref(),
+            Some(Path::new("platforms.json"))
+        );
+        assert_eq!(
+            file_mode.output_file.as_deref(),
+            Some(Path::new("pck-secrets.yaml"))
+        );
+
+        assert!(
+            Args::try_parse_from([
+                "pck-cert-tool",
+                "register",
+                "--input-file",
+                "platforms.json"
+            ])
+            .is_err(),
+            "file mode must require --output-file"
+        );
+    }
 
     /// Creates a fresh temp directory for a test case, tagged for easy identification.
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
