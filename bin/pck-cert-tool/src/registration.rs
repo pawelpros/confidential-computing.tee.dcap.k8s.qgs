@@ -7,7 +7,8 @@
 //! stored; callers decide whether to apply it to the API server or write it to a file.
 
 use crate::pck_secret::{
-    CreatePckSecretInput, pck_secret_manifest, pck_secret_name, piid_index_secret_manifest,
+    CreatePckSecretInput, patch_piid_index, pck_secret_manifest, pck_secret_name,
+    piid_index_secret_manifest,
 };
 use crate::pcs_client::{
     PckCertsRequest, build_pcs_http_client, fetch_pcm, fetch_platform_cache, verify_pcm,
@@ -15,11 +16,19 @@ use crate::pcs_client::{
 use crate::platform_data::{prepare_registration, registration_fingerprint};
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::Secret;
+use kube::{
+    Api,
+    api::{Patch, PatchParams},
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use tracing::{info, instrument, warn};
+
+use crate::FIELD_MANAGER;
+
+const PIID_INDEX_SECRET_NAME: &str = "piid-index";
 
 /// Verified Intel PCS data for one platform, ready to be stored.
 pub struct RegisteredPlatform {
@@ -67,6 +76,11 @@ pub async fn resolve_platform(
 #[derive(Deserialize)]
 struct SecretList {
     items: Vec<Secret>,
+}
+
+struct ImportBundle {
+    pck_secrets: Vec<Secret>,
+    piid_entries: BTreeMap<String, String>,
 }
 
 /// Parses platform-data Secrets and validates them exactly like the watcher does. Invalid
@@ -119,6 +133,95 @@ fn secret_list_manifest(namespace: &str, platforms: &[RegisteredPlatform]) -> se
         "kind": "List",
         "items": items,
     })
+}
+
+fn parse_import_bundle(input: &str, namespace: &str) -> Result<ImportBundle> {
+    let list: SecretList =
+        serde_saphyr::from_str(input).context("Failed to parse PCK Secrets bundle")?;
+    let mut pck_secrets = Vec::new();
+    let mut piid_entries: Option<BTreeMap<String, String>> = None;
+
+    for mut secret in list.items {
+        let name = secret
+            .metadata
+            .name
+            .as_deref()
+            .context("Secret in import bundle has no name")?;
+
+        if name == PIID_INDEX_SECRET_NAME {
+            if piid_entries.is_some() {
+                bail!("Import bundle contains more than one {PIID_INDEX_SECRET_NAME} Secret");
+            }
+            let data = secret
+                .data
+                .take()
+                .context("PIID index Secret has no data")?;
+            let entries = data
+                .into_iter()
+                .map(|(qe_id, pcm)| {
+                    String::from_utf8(pcm.0)
+                        .with_context(|| format!("PIID index entry {qe_id} is not valid UTF-8"))
+                        .map(|pcm| (qe_id, pcm))
+                })
+                .collect::<Result<_>>()?;
+            piid_entries = Some(entries);
+            continue;
+        }
+
+        if !name.ends_with("-pck") {
+            bail!("Unexpected Secret {name} in import bundle");
+        }
+        secret.metadata.namespace = Some(namespace.to_string());
+        pck_secrets.push(secret);
+    }
+
+    let piid_entries =
+        piid_entries.context("Import bundle does not contain a piid-index Secret")?;
+    if piid_entries.is_empty() {
+        bail!("PIID index Secret has no entries");
+    }
+
+    Ok(ImportBundle {
+        pck_secrets,
+        piid_entries,
+    })
+}
+
+/// Imports a file-mode registration bundle without treating its shared PIID index as
+/// authoritative. PCK Secrets are server-side applied individually, then each PIID entry is
+/// patched with its own field manager so entries omitted from this bundle are retained.
+#[instrument(skip(secrets), fields(input_file = %input_file.display(), namespace))]
+pub async fn import_from_file(
+    secrets: &Api<Secret>,
+    namespace: &str,
+    input_file: &Path,
+) -> Result<()> {
+    let input = fs::read_to_string(input_file)
+        .with_context(|| format!("Failed to read input file: {}", input_file.display()))?;
+    let bundle = parse_import_bundle(&input, namespace)?;
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+
+    for secret in bundle.pck_secrets {
+        let name = secret
+            .metadata
+            .name
+            .as_deref()
+            .context("PCK Secret in validated import bundle has no name")?
+            .to_string();
+        secrets
+            .patch(&name, &params, &Patch::Apply(&secret))
+            .await
+            .with_context(|| format!("Failed to apply PCK Secret {name}"))?;
+        info!(pck_secret = %name, namespace, "Imported PCK Secret");
+    }
+
+    for (qe_id, pcm) in bundle.piid_entries {
+        patch_piid_index(secrets, namespace, &qe_id, &pcm)
+            .await
+            .with_context(|| format!("Failed to import PIID index entry {qe_id}"))?;
+    }
+
+    Ok(())
 }
 
 /// Registers the platform-data Secrets in `input_file` (e.g. the output of
@@ -231,5 +334,43 @@ mod tests {
         assert_eq!(items[2]["metadata"]["name"], "piid-index");
         assert_eq!(items[2]["metadata"]["namespace"], "ns");
         assert_eq!(items[2]["data"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn import_bundle_splits_pck_secrets_and_piid_entries() {
+        let platform = |qe_id: &str| RegisteredPlatform {
+            qe_id: qe_id.to_string(),
+            pck_secret: CreatePckSecretInput {
+                fmspc: "AABBCCDDEEFF".to_string(),
+                cache_data: vec![1, 2, 3],
+                expiration_time: 12345,
+                namespace: "export-ns".to_string(),
+                platform_data_fingerprint: "sha256:fp".to_string(),
+                pck_secret_name: pck_secret_name(qe_id),
+            },
+            pcm: format!("pcm-{qe_id}"),
+        };
+        let yaml = serde_saphyr::to_string(&secret_list_manifest(
+            "export-ns",
+            &[platform("a"), platform("b")],
+        ))
+        .unwrap();
+
+        let bundle = parse_import_bundle(&yaml, "import-ns").unwrap();
+
+        assert_eq!(bundle.pck_secrets.len(), 2);
+        assert!(
+            bundle
+                .pck_secrets
+                .iter()
+                .all(|secret| secret.metadata.namespace.as_deref() == Some("import-ns"))
+        );
+        assert_eq!(
+            bundle.piid_entries,
+            BTreeMap::from([
+                ("a".to_string(), "pcm-a".to_string()),
+                ("b".to_string(), "pcm-b".to_string()),
+            ])
+        );
     }
 }
